@@ -2,9 +2,13 @@ package persistlog
 
 import (
 	"fmt"
+	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"sync"
 	"time"
+	"encoding/binary"
+	"bytes"
 )
 
 const (
@@ -65,25 +69,67 @@ outer:
 // interface.
 var _ PersistLog = (*DecayedLog)(nil)
 
-// Delete ...
-func (d *DecayedLog) Delete(hash []byte) error {
-	// Create bucket if not exists.
+// Delete removes a <shared secret hash, CLTV value> key-pair from the
+// sharedHashBucket.
+func (d *DecayedLog) Delete(shortChanID *lnwire.ShortChannelID, hash []byte) error {
+	// Create bucket if one does not exist.
 	return nil
 }
 
-// Get ...
-func (d *DecayedLog) Get(hash []byte) (uint32, error) {
-	// Create bucket if not exists.
+// Get retrieves the CLTV value of a processed HTLC given the first 20 bytes
+// of the Sha-256 hash of the shared secret used during sphinx processing.
+func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
+	uint32, error) {
+	// Create bucket if one does not exist.
 	return 0, nil
 }
 
-// Put ...
-func (d *DecayedLog) Put(hash []byte, value uint32) error {
-	// Create bucket if not exists.
-	return nil
+// Put stores a <shared secret hash, CLTV value> key-pair into the
+// sharedHashBucket.
+func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
+	value uint32) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		return putHelper(tx, shortChanID, hash, value)
+	})
 }
 
-// Start ...
+func putHelper(tx *bolt.Tx, shortChanID *lnwire.ShortChannelID, hash []byte,
+	value uint32) error {
+	var (
+		b bytes.Buffer
+		scratch [8]byte
+	)
+
+	openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
+	if err != nil {
+		return err
+	}
+
+	sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
+	if err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint32(scratch[:4], value)
+	if _, err := b.Write(scratch[:4]); err != nil {
+		return err
+	}
+
+	if err := sharedHashes.Put(hash, b.Bytes()); err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
+	if _, err := b.Write(scratch[:8]); err != nil {
+		return err
+	}
+
+	return openChannels.Put(b.Bytes(), hash)
+}
+
+// Start opens the database we will be using to store hashed shared secrets.
+// It also starts the garbage collector in a goroutine to remove stale
+// database entries.
 func (d *DecayedLog) Start() error {
 	// Open the channeldb for use.
 	var err error
@@ -98,7 +144,7 @@ func (d *DecayedLog) Start() error {
 	return nil
 }
 
-// Stop ...
+// Stop halts the garbage collector and closes channeldb.
 func (d *DecayedLog) Stop() {
 	// Stop garbage collector.
 	close(d.quit)
