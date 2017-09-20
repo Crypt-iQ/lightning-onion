@@ -2,6 +2,7 @@ package persistlog
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"github.com/boltdb/bolt"
@@ -60,6 +61,7 @@ outer:
 		select {
 		case <-time.After(60 * time.Second):
 			// TODO(eugene) logic here
+			fmt.Println("hello")
 		case <-d.quit:
 			break outer
 		}
@@ -75,7 +77,9 @@ var _ PersistLog = (*DecayedLog)(nil)
 // hashSharedSecret Sha-256 hashes the shared secret and returns the first
 // sharedHashSize bytes of the hash.
 func hashSharedSecret(sharedSecret [sharedSecretSize]byte) [sharedHashSize]byte {
-	return nil
+	h := sha256.New()
+	h.Write(sharedSecret[:])
+	return h.Sum(nil)[:sharedHashSize]
 }
 
 // Delete removes a <shared secret hash, CLTV value> key-pair from the
