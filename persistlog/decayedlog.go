@@ -1,14 +1,14 @@
 package persistlog
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"sync"
 	"time"
-	"encoding/binary"
-	"bytes"
 )
 
 const (
@@ -72,15 +72,52 @@ var _ PersistLog = (*DecayedLog)(nil)
 // Delete removes a <shared secret hash, CLTV value> key-pair from the
 // sharedHashBucket.
 func (d *DecayedLog) Delete(shortChanID *lnwire.ShortChannelID, hash []byte) error {
-	// Create bucket if one does not exist.
-	return nil
+	return d.db.Update(func(tx *bolt.Tx) error {
+		var (
+			b       bytes.Buffer
+			scratch [8]byte
+		)
+
+		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
+		if err != nil {
+			return err
+		}
+
+		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
+		if err != nil {
+			return err
+		}
+
+		if err := sharedHashes.Delete(hash); err != nil {
+			return err
+		}
+
+		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
+		if _, err := b.Write(scratch[:8]); err != nil {
+			return err
+		}
+
+		return openChannels.Delete(b.Bytes())
+	})
 }
 
 // Get retrieves the CLTV value of a processed HTLC given the first 20 bytes
 // of the Sha-256 hash of the shared secret used during sphinx processing.
 func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 	uint32, error) {
-	// Create bucket if one does not exist.
+	var (
+		b       bytes.Buffer
+		scratch [8]byte
+		value   uint32
+	)
+
+	err := d.db.View(func(tx *bolt.Tx) error {
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return 0, nil
 }
 
@@ -89,42 +126,40 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 	value uint32) error {
 	return d.db.Update(func(tx *bolt.Tx) error {
-		return putHelper(tx, shortChanID, hash, value)
+		var (
+			b       bytes.Buffer
+			scratch [8]byte
+		)
+
+		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
+		if err != nil {
+			return err
+		}
+
+		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
+		if err != nil {
+			return err
+		}
+
+		binary.BigEndian.PutUint32(scratch[:4], value)
+		if _, err := b.Write(scratch[:4]); err != nil {
+			return err
+		}
+
+		if err := sharedHashes.Put(hash, b.Bytes()); err != nil {
+			return err
+		}
+
+		// Reset the Buffer so we can store shortChanID in it.
+		b.Reset()
+
+		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
+		if _, err := b.Write(scratch[:8]); err != nil {
+			return err
+		}
+
+		return openChannels.Put(b.Bytes(), hash)
 	})
-}
-
-func putHelper(tx *bolt.Tx, shortChanID *lnwire.ShortChannelID, hash []byte,
-	value uint32) error {
-	var (
-		b bytes.Buffer
-		scratch [8]byte
-	)
-
-	openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
-	if err != nil {
-		return err
-	}
-
-	sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
-	if err != nil {
-		return err
-	}
-
-	binary.BigEndian.PutUint32(scratch[:4], value)
-	if _, err := b.Write(scratch[:4]); err != nil {
-		return err
-	}
-
-	if err := sharedHashes.Put(hash, b.Bytes()); err != nil {
-		return err
-	}
-
-	binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
-	if _, err := b.Write(scratch[:8]); err != nil {
-		return err
-	}
-
-	return openChannels.Put(b.Bytes(), hash)
 }
 
 // Start opens the database we will be using to store hashed shared secrets.
