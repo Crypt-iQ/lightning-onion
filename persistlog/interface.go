@@ -21,7 +21,6 @@ type PersistLog interface {
 	// one occurs.
 	Start() error
 
-	// Stop safely stops the on-disk persistent log. It returns an error
-	// if one occurs.
-	Stop() error
+	// Stop safely stops the on-disk persistent log.
+	Stop()
 }
