@@ -15,12 +15,11 @@ type PersistLog interface {
 	// Get retrieves an entry from the persistent log given a ShortChannelID
 	// object and a []byte. It returns the value stored and an error if one
 	// occurs.
-	Get(*lnwire.ShortChannelID, []byte) (interface{}, error)
+	Get(*lnwire.ShortChannelID, []byte) (uint32, error)
 
 	// Put stores an entry into the persistent log given a ShortChannelID
-	// object, a []byte and an accompanying purposefully general type. It
-	// returns an error if one occurs.
-	Put(*lnwire.ShortChannelID, []byte, interface{}) error
+	// object, a []byte and an uint32. It returns an error if one occurs.
+	Put(*lnwire.ShortChannelID, []byte, uint32) error
 
 	// Start starts up the on-disk persistent log. It returns an error if
 	// one occurs.

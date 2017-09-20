@@ -8,6 +8,7 @@ import (
 	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"io"
 	"sync"
 	"time"
 )
@@ -61,7 +62,6 @@ outer:
 		select {
 		case <-time.After(60 * time.Second):
 			// TODO(eugene) logic here
-			fmt.Println("hello")
 		case <-d.quit:
 			break outer
 		}
@@ -77,9 +77,15 @@ var _ PersistLog = (*DecayedLog)(nil)
 // hashSharedSecret Sha-256 hashes the shared secret and returns the first
 // sharedHashSize bytes of the hash.
 func hashSharedSecret(sharedSecret [sharedSecretSize]byte) [sharedHashSize]byte {
+	// Sha256 hash of sharedSecret
 	h := sha256.New()
 	h.Write(sharedSecret[:])
-	return h.Sum(nil)[:sharedHashSize]
+
+	var sharedHash [sharedHashSize]byte
+
+	// Copy bytes to sharedHash
+	copy(sharedHash[:], h.Sum(nil)[:sharedHashSize])
+	return sharedHash
 }
 
 // Delete removes a <shared secret hash, CLTV value> key-pair from the
@@ -93,21 +99,25 @@ func (d *DecayedLog) Delete(shortChanID *lnwire.ShortChannelID, hash []byte) err
 
 		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
 		if err != nil {
-			return err
+			return fmt.Errorf("Unable to create openChannels bucket:"+
+				" %v", err)
 		}
 
 		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
 		if err != nil {
-			return err
+			return fmt.Errorf("Unable to created sharedHashes bucket:"+
+				" %v", err)
 		}
 
 		if err := sharedHashes.Delete(hash); err != nil {
-			return err
+			return fmt.Errorf("Unable to delete from sharedHashes:"+
+				" %v", err)
 		}
 
 		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
 		if _, err := b.Write(scratch[:8]); err != nil {
-			return err
+			return fmt.Errorf("Unable to write to scratch slice:"+
+				" %v", err)
 		}
 
 		return openChannels.Delete(b.Bytes())
@@ -120,6 +130,7 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 	uint32, error) {
 	var (
 		b       bytes.Buffer
+		r       io.Reader
 		scratch [8]byte
 		value   uint32
 	)
@@ -136,7 +147,8 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 		// Serialize ShortChannelID
 		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
 		if _, err := b.Write(scratch[:8]); err != nil {
-			return err
+			return fmt.Errorf("Unable to write into scratch slice:"+
+				" %v", err)
 		}
 
 		// If a key for this ShortChannelID isn't found, then the
@@ -157,11 +169,22 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 
 		// If the sharedHash is found, we use it to find the associated
 		// CLTV in the sharedHashBucket.
-		value = sharedHashes.Get(dbHash)
-		if value == nil {
+		valueBytes := sharedHashes.Get(dbHash)
+		if valueBytes == nil {
 			return fmt.Errorf("sharedHashBucket does not contain "+
 				"sharedHash(%s)", string(dbHash))
 		}
+
+		// Create new io.Reader for valueBytes
+		r = bytes.NewReader(valueBytes)
+
+		// Read into scratch
+		if _, err := r.Read(scratch[:4]); err != nil {
+			return fmt.Errorf("Unable to read into scratch slice:"+
+				" %v", err)
+		}
+
+		value = uint32(binary.BigEndian.Uint32(scratch[:4]))
 
 		return nil
 	})
@@ -184,21 +207,25 @@ func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 
 		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
 		if err != nil {
-			return err
+			return fmt.Errorf("Unable to create bucket openChannels:"+
+				" %v", err)
 		}
 
 		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
 		if err != nil {
-			return err
+			return fmt.Errorf("Unable to create bucket sharedHashes:"+
+				" %v", err)
 		}
 
 		binary.BigEndian.PutUint32(scratch[:4], value)
 		if _, err := b.Write(scratch[:4]); err != nil {
-			return err
+			return fmt.Errorf("Unable to write into scratch slice:"+
+				" %v", err)
 		}
 
 		if err := sharedHashes.Put(hash, b.Bytes()); err != nil {
-			return err
+			return fmt.Errorf("Unable to store in sharedHashes:"+
+				" %v", err)
 		}
 
 		// Reset the Buffer so we can store shortChanID in it.
@@ -206,7 +233,8 @@ func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 
 		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
 		if _, err := b.Write(scratch[:8]); err != nil {
-			return err
+			return fmt.Errorf("Unable to write into scratch slice:"+
+				" %v", err)
 		}
 
 		return openChannels.Put(b.Bytes(), hash)
@@ -217,6 +245,9 @@ func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 // It also starts the garbage collector in a goroutine to remove stale
 // database entries.
 func (d *DecayedLog) Start() error {
+	// Create the quit channel
+	d.quit = make(chan struct{})
+
 	// Open the channeldb for use.
 	var err error
 	if d.db, err = channeldb.Open(defaultDbDirectory); err != nil {
