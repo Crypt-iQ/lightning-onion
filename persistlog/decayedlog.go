@@ -8,7 +8,6 @@ import (
 	"github.com/boltdb/bolt"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"io"
 	"sync"
 	"time"
 )
@@ -129,8 +128,6 @@ func (d *DecayedLog) Delete(shortChanID *lnwire.ShortChannelID, hash []byte) err
 func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 	uint32, error) {
 	var (
-		b       bytes.Buffer
-		r       io.Reader
 		scratch [8]byte
 		value   uint32
 	)
@@ -145,15 +142,11 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 		}
 
 		// Serialize ShortChannelID
-		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
-		if _, err := b.Write(scratch[:8]); err != nil {
-			return fmt.Errorf("Unable to write into scratch slice:"+
-				" %v", err)
-		}
+		binary.BigEndian.PutUint64(scratch[:], shortChanID.ToUint64())
 
 		// If a key for this ShortChannelID isn't found, then the
 		// target node doesn't exist within the database.
-		dbHash := openChannels.Get(b.Bytes())
+		dbHash := openChannels.Get(scratch[:])
 		if dbHash == nil {
 			return fmt.Errorf("openChannelBucket does not contain "+
 				"ShortChannelID(%v)", shortChanID)
@@ -175,16 +168,7 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 				"sharedHash(%s)", string(dbHash))
 		}
 
-		// Create new io.Reader for valueBytes
-		r = bytes.NewReader(valueBytes)
-
-		// Read into scratch
-		if _, err := r.Read(scratch[:4]); err != nil {
-			return fmt.Errorf("Unable to read into scratch slice:"+
-				" %v", err)
-		}
-
-		value = uint32(binary.BigEndian.Uint32(scratch[:4]))
+		value = uint32(binary.BigEndian.Uint32(valueBytes))
 
 		return nil
 	})
@@ -201,8 +185,8 @@ func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 	value uint32) error {
 	return d.db.Update(func(tx *bolt.Tx) error {
 		var (
-			b       bytes.Buffer
-			scratch [8]byte
+			scratch1 [4]byte
+			scratch2 [8]byte
 		)
 
 		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
@@ -217,27 +201,18 @@ func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
 				" %v", err)
 		}
 
-		binary.BigEndian.PutUint32(scratch[:4], value)
-		if _, err := b.Write(scratch[:4]); err != nil {
-			return fmt.Errorf("Unable to write into scratch slice:"+
-				" %v", err)
-		}
+		// Store value into scratch1
+		binary.BigEndian.PutUint32(scratch1[:], value)
 
-		if err := sharedHashes.Put(hash, b.Bytes()); err != nil {
+		if err := sharedHashes.Put(hash, scratch1[:]); err != nil {
 			return fmt.Errorf("Unable to store in sharedHashes:"+
 				" %v", err)
 		}
 
-		// Reset the Buffer so we can store shortChanID in it.
-		b.Reset()
+		// Store shortChanID into scratch2
+		binary.BigEndian.PutUint64(scratch2[:], shortChanID.ToUint64())
 
-		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
-		if _, err := b.Write(scratch[:8]); err != nil {
-			return fmt.Errorf("Unable to write into scratch slice:"+
-				" %v", err)
-		}
-
-		return openChannels.Put(b.Bytes(), hash)
+		return openChannels.Put(scratch2[:], hash)
 	})
 }
 
