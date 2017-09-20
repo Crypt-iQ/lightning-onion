@@ -1,7 +1,6 @@
 package persistlog
 
 import (
-	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
