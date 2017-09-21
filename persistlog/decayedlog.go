@@ -177,13 +177,19 @@ func (d *DecayedLog) Get(hash []byte) (
 // sharedHashBucket.
 func (d *DecayedLog) Put(hash []byte,
 	value uint32) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
+	return d.db.Batch(func(tx *bolt.Tx) error {
 		var scratch [4]byte
 
 		sharedHashes, err := tx.CreateBucketIfNotExists(sharedHashBucket)
 		if err != nil {
 			return fmt.Errorf("Unable to create bucket sharedHashes:"+
 				" %v", err)
+		}
+
+		valueBytes := sharedHashes.Get(hash)
+		if valueBytes != nil {
+			return fmt.Errorf("sharedHashes contains a value for" +
+				"this key")
 		}
 
 		// Store value into scratch1
