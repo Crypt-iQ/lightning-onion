@@ -1,5 +1,5 @@
 hash: 90173eb50478e0c70ae1a8c0ebdb1ca6d652880400d47bfb4fdf65c6a3af6b51
-updated: 2017-09-20T09:08:11.653841298-04:00
+updated: 2017-09-20T14:36:01.543378228-04:00
 imports:
 - name: github.com/aead/chacha20
   version: d31a916ded42d1640b9d89a26f8abd53cc96790c
@@ -24,7 +24,7 @@ imports:
   - lnwire
   - shachain
 - name: github.com/roasbeef/btcd
-  version: 707a14a79daeb2440fe92feaeceb0fae68ab3e9b
+  version: 4b411f0e78f1faa96ae650d886170d018c1835bf
   subpackages:
   - btcec
   - chaincfg
@@ -34,6 +34,7 @@ imports:
   version: 1584022350b4400b511beab6a013f0189adeef40
   subpackages:
   - base58
+  - bech32
 - name: golang.org/x/crypto
   version: 459e26527287adbc2adcc5d0d49abff9a5f315a7
   subpackages:
@@ -43,7 +44,7 @@ imports:
   subpackages:
   - unix
 - name: google.golang.org/grpc
-  version: dce316936bafcd37b1ffeff372d44641a3d68169
+  version: b3ddf786825de56a4178401b7e174ee332173b66
   subpackages:
   - codes
 testImports:

@@ -23,7 +23,7 @@ func newTestRoute(numHops int) ([]*Router, *[]HopData, *OnionPacket, error) {
 				" random key for sphinx node: %v", err)
 		}
 
-		nodes[i] = NewRouter(privKey, &chaincfg.MainNetParams)
+		nodes[i] = NewRouter(privKey, &chaincfg.MainNetParams, nil)
 	}
 
 	// Gather all the pub keys in the path.

@@ -11,9 +11,11 @@ import (
 	"sync"
 
 	"github.com/aead/chacha20"
+	"github.com/lightningnetwork/lightning-onion/persistlog"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcutil"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 )
 
 const (
@@ -605,19 +607,22 @@ type Router struct {
 
 	onionKey *btcec.PrivateKey
 
-	sync.RWMutex
-
-	seenSecrets map[[sharedSecretSize]byte]struct{}
+	d persistlog.DecayedLog
 }
 
 // NewRouter creates a new instance of a Sphinx onion Router given the node's
 // currently advertised onion private key, and the target Bitcoin network.
-func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params) *Router {
+func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params,
+	chainNotifier chainntnfs.ChainNotifier) *Router {
 	var nodeID [addressSize]byte
 	copy(nodeID[:], btcutil.Hash160(nodeKey.PubKey().SerializeCompressed()))
 
 	// Safe to ignore the error here, nodeID is 20 bytes.
 	nodeAddr, _ := btcutil.NewAddressPubKeyHash(nodeID[:], net)
+
+	d := persistlog.DecayedLog{
+		Notifier: chainNotifier,
+	}
 
 	return &Router{
 		nodeID:   nodeID,
@@ -632,7 +637,7 @@ func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params) *Router {
 		},
 		// TODO(roasbeef): replace instead with bloom filter?
 		// * https://moderncrypto.org/mail-archive/messaging/2015/001911.html
-		seenSecrets: make(map[[sharedSecretSize]byte]struct{}),
+		d: d,
 	}
 }
 

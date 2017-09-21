@@ -41,7 +41,7 @@ type DecayedLog struct {
 	db       *channeldb.DB
 	wg       sync.WaitGroup
 	quit     chan (struct{})
-	notifier chainntnfs.ChainNotifier
+	Notifier chainntnfs.ChainNotifier
 }
 
 // garbageCollector deletes entries from sharedHashBucket whose expiry height
@@ -192,7 +192,7 @@ func (d *DecayedLog) Put(hash []byte,
 				"this key")
 		}
 
-		// Store value into scratch1
+		// Store value into scratch
 		binary.BigEndian.PutUint32(scratch[:], value)
 
 		return sharedHashes.Put(hash, scratch[:])
