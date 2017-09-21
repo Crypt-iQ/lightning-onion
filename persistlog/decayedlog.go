@@ -1,15 +1,13 @@
 package persistlog
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"github.com/boltdb/bolt"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"sync"
-	"time"
 )
 
 const (
@@ -27,12 +25,6 @@ const (
 )
 
 var (
-	// openChannelBucket is a bucket which stores all of the currently
-	// open channels. It has a second, nested bucket which is keyed by
-	// the Sha-256 hash of the shared secret used in the sphinx routing
-	// protocol for a particular received HTLC.
-	openChannelBucket = []byte("open-channel")
-
 	// sharedHashBucket is a bucket which houses all the first sharedHashSize
 	// bytes of a received HTLC's hashed shared secret and the HTLC's
 	// expiry block height.
@@ -46,9 +38,10 @@ var (
 // and the current block height. DecayedLog wraps channeldb for simplicity, but
 // must batch writes to the database to decrease write contention.
 type DecayedLog struct {
-	db   *channeldb.DB
-	wg   sync.WaitGroup
-	quit chan (struct{})
+	db       *channeldb.DB
+	wg       sync.WaitGroup
+	quit     chan (struct{})
+	notifier chainntnfs.ChainNotifier
 }
 
 // garbageCollector deletes entries from sharedHashBucket whose expiry height
@@ -56,11 +49,56 @@ type DecayedLog struct {
 func (d *DecayedLog) garbageCollector() error {
 	defer d.wg.Done()
 
+	epochClient, err := d.notifier.RegisterBlockEpochNtfn()
+	if err != nil {
+		return fmt.Errorf("Unable to register for epoch "+
+			"notification: %v", err)
+	}
+	defer epochClient.Cancel()
+
 outer:
 	for {
 		select {
-		case <-time.After(60 * time.Second):
-			// TODO(eugene) logic here
+		case epoch, ok := <-epochClient.Epochs:
+			if !ok {
+				return fmt.Errorf("Epoch client shutting " +
+					"down")
+			}
+
+			err := d.db.View(func(tx *bolt.Tx) error {
+				// Grab the shared hash bucket
+				sharedHashes := tx.Bucket(sharedHashBucket)
+				if sharedHashes == nil {
+					return fmt.Errorf("sharedHashBucket " +
+						"is nil")
+				}
+
+				var expiredCltv [][]byte
+				sharedHashes.ForEach(func(k, v []byte) error {
+					cltv := uint32(binary.BigEndian.Uint32(v))
+					if uint32(epoch.Height) > cltv {
+						// Store expired hash in array
+						expiredCltv = append(expiredCltv, k)
+					}
+					return nil
+				})
+
+				// Delete every item in array
+				for _, hash := range expiredCltv {
+					err = d.Delete(hash)
+					if err != nil {
+						return fmt.Errorf("Unable to delete"+
+							"expired secret: %v", err)
+					}
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return fmt.Errorf("Error viewing channeldb: "+
+					"%v", err)
+			}
 		case <-d.quit:
 			break outer
 		}
@@ -89,72 +127,28 @@ func hashSharedSecret(sharedSecret [sharedSecretSize]byte) [sharedHashSize]byte 
 
 // Delete removes a <shared secret hash, CLTV value> key-pair from the
 // sharedHashBucket.
-func (d *DecayedLog) Delete(shortChanID *lnwire.ShortChannelID, hash []byte) error {
+func (d *DecayedLog) Delete(hash []byte) error {
 	return d.db.Update(func(tx *bolt.Tx) error {
-		var (
-			b       bytes.Buffer
-			scratch [8]byte
-		)
-
-		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
-		if err != nil {
-			return fmt.Errorf("Unable to create openChannels bucket:"+
-				" %v", err)
-		}
-
-		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
+		sharedHashes, err := tx.CreateBucketIfNotExists(sharedHashBucket)
 		if err != nil {
 			return fmt.Errorf("Unable to created sharedHashes bucket:"+
 				" %v", err)
 		}
 
-		if err := sharedHashes.Delete(hash); err != nil {
-			return fmt.Errorf("Unable to delete from sharedHashes:"+
-				" %v", err)
-		}
-
-		binary.BigEndian.PutUint64(scratch[:8], shortChanID.ToUint64())
-		if _, err := b.Write(scratch[:8]); err != nil {
-			return fmt.Errorf("Unable to write to scratch slice:"+
-				" %v", err)
-		}
-
-		return openChannels.Delete(b.Bytes())
+		return sharedHashes.Delete(hash)
 	})
 }
 
 // Get retrieves the CLTV value of a processed HTLC given the first 20 bytes
 // of the Sha-256 hash of the shared secret used during sphinx processing.
-func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
+func (d *DecayedLog) Get(hash []byte) (
 	uint32, error) {
-	var (
-		scratch [8]byte
-		value   uint32
-	)
+	var value uint32
 
 	err := d.db.View(func(tx *bolt.Tx) error {
-		// First grab the open channels bucket which stores the mapping
-		// from serialized ShortChannelID to shared secret hash.
-		openChannels := tx.Bucket(openChannelBucket)
-		if openChannels == nil {
-			return fmt.Errorf("openChannelBucket is nil, could " +
-				"not retrieve CLTV value")
-		}
-
-		// Serialize ShortChannelID
-		binary.BigEndian.PutUint64(scratch[:], shortChanID.ToUint64())
-
-		// If a key for this ShortChannelID isn't found, then the
-		// target node doesn't exist within the database.
-		dbHash := openChannels.Get(scratch[:])
-		if dbHash == nil {
-			return fmt.Errorf("openChannelBucket does not contain "+
-				"ShortChannelID(%v)", shortChanID)
-		}
-
 		// Grab the shared hash bucket which stores the mapping from
 		// truncated sha-256 hashes of shared secrets to CLTV values.
-		sharedHashes := openChannels.Bucket(sharedHashBucket)
+		sharedHashes := tx.Bucket(sharedHashBucket)
 		if sharedHashes == nil {
 			return fmt.Errorf("sharedHashes is nil, could " +
 				"not retrieve CLTV value")
@@ -162,10 +156,10 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 
 		// If the sharedHash is found, we use it to find the associated
 		// CLTV in the sharedHashBucket.
-		valueBytes := sharedHashes.Get(dbHash)
+		valueBytes := sharedHashes.Get(hash)
 		if valueBytes == nil {
-			return fmt.Errorf("sharedHashBucket does not contain "+
-				"sharedHash(%s)", string(dbHash))
+			return fmt.Errorf("sharedHashBucket does not contain " +
+				"hashedSecret")
 		}
 
 		value = uint32(binary.BigEndian.Uint32(valueBytes))
@@ -181,38 +175,21 @@ func (d *DecayedLog) Get(shortChanID *lnwire.ShortChannelID, hash []byte) (
 
 // Put stores a <shared secret hash, CLTV value> key-pair into the
 // sharedHashBucket.
-func (d *DecayedLog) Put(shortChanID *lnwire.ShortChannelID, hash []byte,
+func (d *DecayedLog) Put(hash []byte,
 	value uint32) error {
 	return d.db.Update(func(tx *bolt.Tx) error {
-		var (
-			scratch1 [4]byte
-			scratch2 [8]byte
-		)
+		var scratch [4]byte
 
-		openChannels, err := tx.CreateBucketIfNotExists(openChannelBucket)
-		if err != nil {
-			return fmt.Errorf("Unable to create bucket openChannels:"+
-				" %v", err)
-		}
-
-		sharedHashes, err := openChannels.CreateBucketIfNotExists(sharedHashBucket)
+		sharedHashes, err := tx.CreateBucketIfNotExists(sharedHashBucket)
 		if err != nil {
 			return fmt.Errorf("Unable to create bucket sharedHashes:"+
 				" %v", err)
 		}
 
 		// Store value into scratch1
-		binary.BigEndian.PutUint32(scratch1[:], value)
+		binary.BigEndian.PutUint32(scratch[:], value)
 
-		if err := sharedHashes.Put(hash, scratch1[:]); err != nil {
-			return fmt.Errorf("Unable to store in sharedHashes:"+
-				" %v", err)
-		}
-
-		// Store shortChanID into scratch2
-		binary.BigEndian.PutUint64(scratch2[:], shortChanID.ToUint64())
-
-		return openChannels.Put(scratch2[:], hash)
+		return sharedHashes.Put(hash, scratch[:])
 	})
 }
 
@@ -230,8 +207,10 @@ func (d *DecayedLog) Start() error {
 	}
 
 	// Start garbage collector.
-	d.wg.Add(1)
-	go d.garbageCollector()
+	if d.notifier != nil {
+		d.wg.Add(1)
+		go d.garbageCollector()
+	}
 
 	return nil
 }

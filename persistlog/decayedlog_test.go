@@ -2,9 +2,12 @@ package persistlog
 
 import (
 	"crypto/sha256"
-	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/roasbeef/btcd/btcec"
+	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/roasbeef/btcd/wire"
 	"testing"
+	"time"
 )
 
 var (
@@ -17,6 +20,36 @@ var (
 	}
 )
 
+type mockNotifier struct {
+	confChannel chan *chainntnfs.TxConfirmation
+	epochChan   chan *chainntnfs.BlockEpoch
+}
+
+func (m *mockNotifier) RegisterBlockEpochNtfn() (*chainntnfs.BlockEpochEvent, error) {
+	return &chainntnfs.BlockEpochEvent{
+		Epochs: m.epochChan,
+		Cancel: func() {},
+	}, nil
+}
+
+func (m *mockNotifier) RegisterConfirmationsNtfn(txid *chainhash.Hash, numConfs,
+	heightHint uint32) (*chainntnfs.ConfirmationEvent, error) {
+	return nil, nil
+}
+
+func (m *mockNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
+	heightHint uint32) (*chainntnfs.SpendEvent, error) {
+	return nil, nil
+}
+
+func (m *mockNotifier) Start() error {
+	return nil
+}
+
+func (m *mockNotifier) Stop() error {
+	return nil
+}
+
 // generateSharedSecret generates a shared secret given a public key and a
 // private key. It is directly copied from sphinx.go.
 func generateSharedSecret(pub *btcec.PublicKey, priv *btcec.PrivateKey) [32]byte {
@@ -28,26 +61,81 @@ func generateSharedSecret(pub *btcec.PublicKey, priv *btcec.PrivateKey) [32]byte
 	return sha256.Sum256(s.SerializeCompressed())
 }
 
-// TestDecayedLogInsertionAndRetrieval inserts a CLTV value into the nested
+// TestDecayedLogGarbageCollector tests the ability of the garbage collector
+// to delete expired cltv values every time a block is received. Expired cltv
+// values are cltv values that are <= current block height.
+func TestDecayedLogGarbageCollector(t *testing.T) {
+	t.Parallel()
+
+	// Random (EXPIRED) cltv value
+	cltv := uint32(200390)
+
+	// Create the MockNotifier which triggers the garbage collector
+	MockNotifier := &mockNotifier{
+		epochChan: make(chan *chainntnfs.BlockEpoch, 1),
+	}
+
+	// Create a DecayedLog object
+	d := DecayedLog{notifier: MockNotifier}
+
+	// Open the channeldb (start the garbage collector)
+	err := d.Start()
+	if err != nil {
+		t.Fatalf("Unable to start / open DecayedLog")
+	}
+	defer d.Stop()
+
+	// Create a new private key on elliptic curve secp256k1
+	priv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		t.Fatalf("Unable to create new private key")
+	}
+
+	// Generate a public key from the key bytes
+	_, testPub := btcec.PrivKeyFromBytes(btcec.S256(), key[:])
+
+	// Generate a shared secret with the public and private keys we made
+	secret := generateSharedSecret(testPub, priv)
+
+	// Create the hashedSecret given the shared secret we just generated.
+	// This is the first 20 bytes of the Sha-256 hash of the shared secret.
+	// This is used as a key to retrieve the cltv value.
+	hashedSecret := hashSharedSecret(secret)
+
+	// Store <hashedSecret, cltv> in the sharedHashBucket.
+	err = d.Put(hashedSecret[:], cltv)
+	if err != nil {
+		t.Fatalf("Unable to store in channeldb")
+	}
+
+	// Send Block notification to garbage collector. The garbage collector
+	// should remove the entry we just added to sharedHashBucket as it is
+	// now expired.
+	MockNotifier.epochChan <- &chainntnfs.BlockEpoch{
+		Height: int32(cltv + 1),
+	}
+
+	// Wait for database write (GC is in a goroutine)
+	time.Sleep(300 * time.Millisecond)
+
+	// Assert that hashedSecret is not in the sharedHashBucket
+	_, err = d.Get(hashedSecret[:])
+	if err == nil {
+		t.Fatalf("Delete failed - received no error message")
+	} else if err != nil && err.Error() != "sharedHashBucket does not contain "+
+		"hashedSecret" {
+		t.Fatalf("Delete failed - received the wrong error message")
+	}
+}
+
+// TestDecayedLogInsertionAndRetrieval inserts a cltv value into the nested
 // sharedHashBucket and then deletes it and finally asserts that we can no
 // longer retrieve it.
 func TestDecayedLogInsertionAndDeletion(t *testing.T) {
-	//
-}
-
-// TestDecayedLogStartAndStop ...
-func TestDecayedLogStartAndStop(t *testing.T) {
-	//
-}
-
-// TestDecayedLogStorageAndRetrieval stores a CLTV value and then retrieves it
-// via the nested sharedHashBucket and finally asserts that the original stored
-// and retrieved CLTV values are equal.
-func TestDecayedLogStorageAndRetrieval(t *testing.T) {
 	t.Parallel()
 
-	cltv := uint32(100)
-	shortChan := uint64(102031)
+	// Random cltv value
+	cltv := uint32(503928)
 
 	// Create a DecayedLog object
 	d := DecayedLog{}
@@ -59,36 +147,181 @@ func TestDecayedLogStorageAndRetrieval(t *testing.T) {
 	}
 	defer d.Stop()
 
-	// Create a new private key on elliptice curve secp256k1
+	// Create a new private key on elliptic curve secp256k1
 	priv, err := btcec.NewPrivateKey(btcec.S256())
 	if err != nil {
-		t.Fatalf("Unable to create new private key 2")
+		t.Fatalf("Unable to create new private key")
 	}
 
-	// Generate a public key from the key bytes above
+	// Generate a public key from the key bytes
 	_, testPub := btcec.PrivKeyFromBytes(btcec.S256(), key[:])
 
 	// Generate a shared secret with the public and private keys we made
 	secret := generateSharedSecret(testPub, priv)
-
-	// Create a new ShortChannelID given shortChan. This is used as a key
-	// to retrieve the hashedSecret.
-	shortChanID := lnwire.NewShortChanIDFromInt(shortChan)
 
 	// Create the hashedSecret given the shared secret we just generated.
 	// This is the first 20 bytes of the Sha-256 hash of the shared secret.
 	// This is used as a key to retrieve the cltv value.
 	hashedSecret := hashSharedSecret(secret)
 
-	// Store <shortChanID, hashedSecret> in the openChannelBucket &
-	// store <hashedSecret, cltv> in the sharedHashBucket.
-	err = d.Put(&shortChanID, hashedSecret[:], cltv)
+	// Store <hashedSecret, cltv> in the sharedHashBucket.
+	err = d.Put(hashedSecret[:], cltv)
+	if err != nil {
+		t.Fatalf("Unable to store in channeldb")
+	}
+
+	// Delete hashedSecret from the sharedHashBucket.
+	err = d.Delete(hashedSecret[:])
+	if err != nil {
+		t.Fatalf("Unable to delete from channeldb")
+	}
+
+	// Assert that hashedSecret is not in the sharedHashBucket
+	_, err = d.Get(hashedSecret[:])
+	if err == nil {
+		t.Fatalf("Delete failed - received no error message")
+	} else if err != nil && err.Error() != "sharedHashBucket does not contain "+
+		"hashedSecret" {
+		t.Fatalf("Delete failed - received the wrong error message")
+	}
+
+}
+
+// TestDecayedLogStartAndStop tests for persistence. The DecayedLog is started,
+// a cltv value is stored in the sharedHashBucket, and then it the DecayedLog
+// is stopped. The DecayedLog is then started up again and we test that the
+// cltv value is indeed still stored in the sharedHashBucket. We then delete
+// the cltv value and check that it persists upon startup.
+func TestDecayedLogStartAndStop(t *testing.T) {
+	t.Parallel()
+
+	// Random cltv value
+	cltv := uint32(909020)
+
+	// Create a DecayedLog object
+	d := DecayedLog{}
+
+	// Open the channeldb
+	err := d.Start()
+	if err != nil {
+		t.Fatalf("Unable to start / open DecayedLog")
+	}
+	defer d.Stop()
+
+	// Create a new private key on elliptic curve secp256k1
+	priv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		t.Fatalf("Unable to create new private key")
+	}
+
+	// Generate a public key from the key bytes
+	_, testPub := btcec.PrivKeyFromBytes(btcec.S256(), key[:])
+
+	// Generate a shared secret with the public and private keys we made
+	secret := generateSharedSecret(testPub, priv)
+
+	// Create the hashedSecret given the shared secret we just generated.
+	// This is the first 20 bytes of the Sha-256 hash of the shared secret.
+	// This is used as a key to retrieve the cltv value.
+	hashedSecret := hashSharedSecret(secret)
+
+	// Store <hashedSecret, cltv> in the sharedHashBucket.
+	err = d.Put(hashedSecret[:], cltv)
+	if err != nil {
+		t.Fatalf("Unable to store in channeldb")
+	}
+
+	// Shutdown the DecayedLog's channeldb
+	d.Stop()
+
+	// Startup the DecayedLog's channeldb
+	err = d.Start()
+	if err != nil {
+		t.Fatalf("Unable to start / open DecayedLog")
+	}
+
+	// Retrieve the stored cltv value given the hashedSecret key.
+	value, err := d.Get(hashedSecret[:])
+	if err != nil {
+		t.Fatalf("Unable to retrieve from channeldb")
+	}
+
+	// Check that the original cltv value matches the retrieved cltv
+	// value.
+	if cltv != value {
+		t.Fatalf("Value retrieved doesn't match value stored")
+	}
+
+	// Delete hashedSecret from sharedHashBucket
+	err = d.Delete(hashedSecret[:])
+	if err != nil {
+		t.Fatalf("Unable to delete from channeldb")
+	}
+
+	// Shutdown the DecayedLog's channeldb
+	d.Stop()
+
+	// Startup the DecayedLog's channeldb
+	err = d.Start()
+	if err != nil {
+		t.Fatalf("Unable to start / open DecayedLog")
+	}
+
+	// Assert that hashedSecret is not in the sharedHashBucket
+	_, err = d.Get(hashedSecret[:])
+	if err == nil {
+		t.Fatalf("Delete failed - received no error message")
+	} else if err != nil && err.Error() != "sharedHashBucket does not contain "+
+		"hashedSecret" {
+		t.Fatalf("Delete failed - received the wrong error message")
+	}
+
+}
+
+// TestDecayedLogStorageAndRetrieval stores a cltv value and then retrieves it
+// via the nested sharedHashBucket and finally asserts that the original stored
+// and retrieved cltv values are equal.
+func TestDecayedLogStorageAndRetrieval(t *testing.T) {
+	t.Parallel()
+
+	// Random cltv value
+	cltv := uint32(302930)
+
+	// Create a DecayedLog object
+	d := DecayedLog{}
+
+	// Open the channeldb
+	err := d.Start()
+	if err != nil {
+		t.Fatalf("Unable to start / open DecayedLog")
+	}
+	defer d.Stop()
+
+	// Create a new private key on elliptic curve secp256k1
+	priv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		t.Fatalf("Unable to create new private key")
+	}
+
+	// Generate a public key from the key bytes
+	_, testPub := btcec.PrivKeyFromBytes(btcec.S256(), key[:])
+
+	// Generate a shared secret with the public and private keys we made
+	secret := generateSharedSecret(testPub, priv)
+
+	// Create the hashedSecret given the shared secret we just generated.
+	// This is the first 20 bytes of the Sha-256 hash of the shared secret.
+	// This is used as a key to retrieve the cltv value.
+	hashedSecret := hashSharedSecret(secret)
+
+	// Store <hashedSecret, cltv> in the sharedHashBucket
+	err = d.Put(hashedSecret[:], cltv)
 	if err != nil {
 		t.Fatalf("Unable to store in channeldb")
 	}
 
 	// Retrieve the stored cltv value given the hashedSecret key.
-	value, err := d.Get(&shortChanID, hashedSecret[:])
+	value, err := d.Get(hashedSecret[:])
 	if err != nil {
 		t.Fatalf("Unable to retrieve from channeldb")
 	}
